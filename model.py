@@ -1,10 +1,10 @@
-import os,random,math,warnings,codecs,logging
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-from transformers import TFBertForSequenceClassification,create_optimizer,TFPreTrainedModel,BertTokenizer,BertConfig
+import os,random,math,codecs,logging,shutil
+from transformers import TFBertForSequenceClassification,create_optimizer,BertTokenizer,BertConfig
 import tensorflow as tf
 from tensorflow.python.distribute.values import PerReplica
 import numpy as np
-from sklearn.metrics import f1_score
+from pathlib import Path
+from sklearn.metrics import f1_score,classification_report
 
 
 logging.disable(30)
@@ -15,10 +15,7 @@ logging.basicConfig(level=logging.INFO,
                         # filemode='w'
                     )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-# logger.addFilter(FilterLog)
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
-warnings.filterwarnings('ignore')
 
 
 class BaseArguments(object):
@@ -64,6 +61,8 @@ def set_seed(seed: int):
 
 def compute_metrics(y_true, y_pred) -> float:
     f1 = f1_score(y_true, y_pred, average='macro')
+    # report = classification_report(y_true,y_pred,output_dict=True)
+    # print(report)
     return f1
 
 
@@ -74,12 +73,12 @@ class TFTrainer:
         config = BertConfig.from_pretrained(self.args.model_name_or_path,num_labels=len(self.label2id))
         self.model = TFBertForSequenceClassification(config=config)
         self.compute_metrics = compute_metrics
-        self.tb_writer = tf.summary.create_file_writer(os.path.join(self.args.output_dir,"log"))
-
+        # self.tb_writer = tf.summary.create_file_writer(os.path.join(self.args.output_dir,"log"))
+        print(self.label2id)
         set_seed(self.args.seed)
         self.tokenizer = BertTokenizer.from_pretrained(self.args.tokenizer_dir)
         self.train_dataset = self.read_dataset("train.txt")
-        self.eval_dataset = self.read_dataset("eval.txt")[:10]
+        self.eval_dataset = self.read_dataset("eval.txt")[:]
 
     def train_generator(self,content):
         random.shuffle(content)
@@ -119,18 +118,15 @@ class TFTrainer:
 
         with self.args.strategy.scope():
             self.optimizer, self.lr_scheduler = self.create_optimizer_and_scheduler(num_training_steps=t_total)
-            folder = os.path.join(self.args.output_dir, "checkpoint")
-            ckpt = tf.train.Checkpoint(optimizer=self.optimizer, model=self.model)
-            self.model.ckpt_manager = tf.train.CheckpointManager(ckpt, folder, max_to_keep=self.args.save_total_limit)
 
-            logger.info("***** Running training *****")
-            logger.info(f"  Train Num examples per epoch = {len(self.train_dataset)}")
-            logger.info(f"  Eval Num examples per epoch = {eval_example_nums}")
-            logger.info(f"  Num Epochs = {epochs}")
-            logger.info(f"  Instantaneous batch size = {self.args.batch_size}")
-            logger.info(f"  Train Steps per epoch = {num_steps}")
-            logger.info(f"  Eval Steps per epoch = {math.ceil(eval_example_nums / self.args.batch_size)}")
-            logger.info(f"  Total optimization steps = {t_total}")
+            logger.error("***** Running training *****")
+            logger.error(f"  Train Num examples per epoch = {train_example_nums}")
+            logger.error(f"  Eval Num examples per epoch = {eval_example_nums}")
+            logger.error(f"  Num Epochs = {epochs}")
+            logger.error(f"  Instantaneous batch size = {self.args.batch_size}")
+            logger.error(f"  Train Steps per epoch = {num_steps}")
+            logger.error(f"  Eval Steps per epoch = {math.ceil(eval_example_nums / self.args.batch_size)}")
+            logger.error(f"  Total optimization steps = {t_total}")
 
             global_step = 0
             best_f1 = 0
@@ -138,24 +134,20 @@ class TFTrainer:
             for epoch_curr in range(int(epochs)):
                 train_dataloader,eval_dataloader = self.get_dataloader()
                 for step, batch in enumerate(train_dataloader):
-                    print(step)
                     global_step += 1
                     self.distributed_training_steps(batch)
                     training_loss = self.train_loss.result()
                     self.train_loss.reset_states()
 
                     if global_step % self.args.logging_steps == 0:
-                        f1 = self.evaluate(eval_dataloader)
-                        step_loss_lr_f1 = f"step:{global_step}-loss{training_loss.numpy()}:-lr:{self.lr_scheduler(global_step).numpy()}-f1:{f1}"
-                        logger.info(step_loss_lr_f1)
-                        print(step_loss_lr_f1)
+                        preds, label_ids, f1 = self.evaluate(eval_dataloader)
+                        step_loss_lr_f1 = f"step:{global_step}-loss{training_loss.numpy():.4f}:-lr:{self.lr_scheduler(global_step).numpy()}-f1:{f1:.6f}"
+                        logger.error(step_loss_lr_f1)
                         if f1 > best_f1:
                             score_up = f"F1 from {best_f1} to {f1}"
-                            logger.info(score_up)
-                            print(score_up)
+                            logger.error(score_up)
                             best_f1 = f1
-                            ckpt_save_path = self.model.ckpt_manager.save()
-                            # logger.info("Saving checkpoint for step {} at {}".format(global_step, ckpt_save_path))
+                            self.save_model(epoch_curr,global_step,best_f1)
 
     def training_step(self, features, labels, nb_instances_in_global_batch):
         per_example_loss, _ = self.run_model(features, labels, True)
@@ -163,31 +155,22 @@ class TFTrainer:
         self.train_loss.update_state(per_example_loss)
         gradients = tf.gradients(scaled_loss, self.model.trainable_variables)
         gradients = [g if g is not None else tf.zeros_like(v) for g, v in zip(gradients, self.model.trainable_variables)]
-        return gradients
-
-    def apply_gradients(self, features, labels, nb_instances_in_global_batch):
-        gradients = self.training_step(features, labels, nb_instances_in_global_batch)
         self.optimizer.apply_gradients(list(zip(gradients, self.model.trainable_variables)))
+        return gradients
 
     @tf.function
     def distributed_training_steps(self, batch):
         with self.args.strategy.scope():
-            nb_instances_in_batch = self._compute_nb_instances(batch)
-            inputs = self._get_step_inputs(batch, nb_instances_in_batch)
-            self.args.strategy.run(self.apply_gradients, inputs)
+            inputs = self._get_step_inputs(batch)
+            self.args.strategy.run(self.training_step, inputs)
 
     @staticmethod
-    def _compute_nb_instances(batch):
-        labels = batch[-1]
+    def _get_step_inputs(batch):
+        features, labels = batch
         if isinstance(labels, PerReplica):
             labels = tf.concat(labels.values, axis=0)
-
         nb_instances = tf.reduce_sum(tf.cast(labels != -100, dtype=tf.int32))
-        return nb_instances
 
-    @staticmethod
-    def _get_step_inputs(batch, nb_instances):
-        features, labels = batch
         if isinstance(labels, PerReplica):
             # need to make a `PerReplica` objects for ``nb_instances``
             nb_instances = PerReplica([nb_instances] * len(labels.values))
@@ -195,27 +178,11 @@ class TFTrainer:
         return step_inputs
 
     def run_model(self, features, labels, training):
-        outputs = self.model(input_ids=features,
-                             labels=labels,
-                             output_attentions=False,
-                             training=training,
-                             output_hidden_states=False,
-                             return_dict=False)[:2]
+        outputs = self.model(input_ids=features,labels=labels,training=training)[:2]
         loss, logits = outputs[:2]
         return loss, logits
 
-    def save_model(self, output_dir: str = None):
-        """
-        Will save the model, so you can reload it using :obj:`from_pretrained()`.
-        """
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
-
-        if not isinstance(self.model, TFPreTrainedModel):
-            raise ValueError("Trainer.model appears to not be a PreTrainedModel")
-
-        self.model.save_pretrained(output_dir)
-
-    def prediction_loop(self,dataset: tf.data.Dataset):
+    def evaluate(self, dataset: tf.data.Dataset = None):
         label_ids: np.ndarray = None
         preds: np.ndarray = None
 
@@ -255,14 +222,10 @@ class TFTrainer:
         if self.compute_metrics is not None and preds is not None and label_ids is not None:
             label_ids = label_ids.flatten()
             preds = np.argmax(preds, axis=1)
-            metrics = self.compute_metrics(label_ids,preds)
+            metrics = self.compute_metrics(label_ids, preds)
         else:
             metrics = {}
         return preds, label_ids, metrics
-
-    def evaluate(self, dataset: tf.data.Dataset = None) -> float:
-        preds, label_ids, metrics = self.prediction_loop(dataset)
-        return metrics
 
     def prediction_step(self, features: tf.Tensor, labels: tf.Tensor) -> tf.Tensor:
         per_example_loss, logits = self.run_model(features, labels, False)
@@ -272,6 +235,40 @@ class TFTrainer:
     def distributed_prediction_steps(self, batch):
         logits = self.args.strategy.run(self.prediction_step, batch)
         return logits
+
+    def save_model(self, epoch, global_step, best_score):
+        file_dir = os.path.join(self.args.output_dir, f"checkpoint-epoch-{epoch}-step-{global_step}-f1-{best_score:.6f}")
+        os.makedirs(file_dir, exist_ok=True)
+        logger.error("Saving model checkpoint to %s", file_dir)
+        self.model.save_pretrained(file_dir)
+        self._rotate_checkpoints(self.args.output_dir)
+
+    def _rotate_checkpoints(self, output_dir) -> None:
+        # Check if we should delete older checkpoint(s)
+        checkpoints_sorted = self._sorted_checkpoints(output_dir)
+        if len(checkpoints_sorted) <= self.args.save_total_limit:
+            return
+
+        number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - self.args.save_total_limit)
+        checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
+        for checkpoint in checkpoints_to_be_deleted:
+            logger.error("Deleting older checkpoint [{}] due to args.save_total_limit:{}".format(checkpoint,self.args.save_total_limit))
+            shutil.rmtree(checkpoint)
+
+    def _sorted_checkpoints(self, output_dir):
+        ordering_and_checkpoint_path = []
+
+        glob_checkpoints = [str(x) for x in Path(output_dir).glob(f"checkpoint-*")]
+
+        for path in glob_checkpoints:
+            try:
+                tup = (float(path.split("-")[-1]), path)
+                ordering_and_checkpoint_path.append(tup)
+            except:
+                logger.info("")
+        checkpoints_sorted = sorted(ordering_and_checkpoint_path, key=lambda x: x[0])
+        checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+        return checkpoints_sorted
 
 
 if __name__ == '__main__':
